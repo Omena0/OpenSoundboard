@@ -18,8 +18,10 @@ active_streams: List[StreamInfo] = []
 streams_lock = threading.Lock()
 active_count = threading.Event()
 active_count.set()
+mic_stream = None
+mic_lock = threading.Lock()
 
-def _resample_if_needed(data: np.ndarray, src_rate: int, target_rate: int) -> np.ndarray:
+def _resample_audio(data: np.ndarray, src_rate: int, target_rate: int) -> np.ndarray:
     """Resample audio data if source and target rates differ using numpy linear interpolation"""
     if src_rate == target_rate:
         return data
@@ -45,13 +47,13 @@ def _resample_if_needed(data: np.ndarray, src_rate: int, target_rate: int) -> np
 
 def loadFile(filename: str, normalize: bool = False, target_db: float = -20.0, silence_threshold: float = 0.01) -> tuple:
     """Load audio file and cache it with optional normalization and silence removal
-    
+
     Args:
         filename: Path to sound file
         normalize: Whether to normalize audio volume (default: False)
         target_db: Target RMS level in dB for normalization (default: -20.0)
         silence_threshold: Amplitude threshold below which frames are considered silent (default: 0.01)
-        
+
     Returns:
         tuple: (audio_data, sample_rate)
     """
@@ -110,7 +112,7 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize:
         # Get device info and resample if needed
         device_info = sd.query_devices(device=device or sd.default.device[1])
         target_samplerate = int(device_info['default_samplerate'])
-        data = _resample_if_needed(data, src_samplerate, target_samplerate)
+        data = _resample_audio(data, src_samplerate, target_samplerate)
 
         # Convert to float32 stereo
         if len(data.shape) == 1:
@@ -176,6 +178,7 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize:
 
 def stopAll() -> None:
     """Stop all active sound playback"""
+    global active_streams
     with streams_lock:
         for stream_info in active_streams:
             try:
@@ -183,6 +186,75 @@ def stopAll() -> None:
                 stream_info.stream.close()
             except Exception:
                 ...  # Ignore errors during forced cleanup
-        active_streams.clear()
+        active_streams.clear()  # Clear the global list instead of reassignment
 
-__all__ = [loadFile,playSound,stopAll]
+def startMicPassthrough(output_device, input_device=None, volume: float = 1.0) -> None:
+    """Start microphone passthrough with resampling support
+
+    Args:
+        output_device: Output device name or index (required)
+        input_device: Input device name or index (default: system default)
+        volume: Volume multiplier (0.0 to 2.0, default: 1.0)
+    """
+    global mic_stream
+
+    try:
+        # Use system default for input if not specified
+        if input_device is None:
+            input_device = sd.default.device[0]
+
+        # Get device info and sample rates
+        input_info = sd.query_devices(input_device)
+        output_info = sd.query_devices(output_device)
+
+        print(input_info['name'])
+        print(output_info['name'])
+
+        input_rate = int(input_info['default_samplerate'])
+        output_rate = int(output_info['default_samplerate'])
+
+        with mic_lock:
+            if mic_stream is not None:
+                stopMicPassthrough()
+
+            def callback(indata, outdata, frames, time, status):
+                # Ensure correct channel count
+                indata = indata[:, :2] if indata.shape[1] > 2 else indata
+
+
+                # Resample if rates differ
+                if input_rate != output_rate:
+                    resampled = _resample_audio(indata, input_rate, output_rate)
+                    frames_to_write = min(len(resampled), len(outdata))
+                    outdata[:frames_to_write] = resampled[:frames_to_write] * volume
+                    if frames_to_write < len(outdata):
+                        outdata[frames_to_write:] = 0
+                else:
+                    outdata[:] = indata * volume
+
+            mic_stream = sd.Stream(
+                device=(input_device, output_device),
+                callback=callback,
+                dtype=np.float32,
+                samplerate=output_rate,
+                channels=(input_info['max_input_channels'],
+                         output_info['max_output_channels'])
+            )
+            mic_stream.start()
+
+    except Exception as e:
+        print(f"\nError details: {str(e)}")
+        raise RuntimeError(f"Failed to start mic passthrough: {str(e)}") from e
+
+def stopMicPassthrough() -> None:
+    """Stop microphone passthrough if active"""
+    global mic_stream
+
+    with mic_lock:
+        if mic_stream is not None:
+            mic_stream.stop()
+            mic_stream.close()
+            mic_stream = None
+
+# Update __all__
+__all__ = [loadFile, playSound, stopAll, startMicPassthrough, stopMicPassthrough]
