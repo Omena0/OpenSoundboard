@@ -1,25 +1,42 @@
+import tkinter.messagebox as msgbox
 import customtkinter as tki
+from configLib import *
 import soundlib as sl
+import tkinter as tk
+import time as t
 import os, sys
 
 os.makedirs('sounds/default',exist_ok=True)
+os.makedirs('sounds/unused',exist_ok=True)
 
-# Sound config
-output_device = 16 # VB CABLE INPUT
+defaultconfig = r"""
+[Devices]
+output_device = "CABLE Input (VB-Audio Virtual Cable), Windows WASAPI"
+input_device  = "Microphone Array (Realtek(R) Audio), Windows WASAPI"
+
+[Audio]
 volume = 2
 normalize_db = -30
 bass_boost = 10
+min_volume = 0.05
+max_volume = 5
 
+"""
 
-profiles = {}
+setDefault(defaultconfig)
 
-selectedProfile = 'default'
+config = loadConfig()
+
+categories = {}
+
+selectedCategory = 'default'
 
 # UI Config
 buttonWidth = 66
 buttonHeight = 50
 buttonsPerRow = 4
 buttons = []
+topButtons = []
 
 # Create UI
 root = tki.CTk()
@@ -27,27 +44,84 @@ root.title('OpenSoundBoard')
 root.geometry(f'{buttonWidth*5+25}x{buttonHeight*3+75}')
 root.wm_attributes('-topmost', True)
 
+def run(*args, **kwargs):
+    if callable(args[0]) and len(args) == 1 and not kwargs:
+        args[0]()
+        return args[0]
 
-for profile in os.listdir('sounds'):
-    if not os.path.isdir(f'sounds/{profile}'):
-        continue
+    def inner(callback):
+        callback(*args, **kwargs)
+        return callback
+    return inner
 
-    profiles[profile] = os.listdir(f'sounds/{profile}')
+def createCallback(func, *args, **kwargs):
+    def callback():
+        func(*args, **kwargs)
+    return callback
 
+topBar = tki.CTkFrame(root,500,28)
+topBar.place(x=3,y=0)
 
-def createButtons(profile):
+def newCategory():
+    path = 'sounds/New Category'
+    while os.path.exists(path):
+        if path[-2].isnumeric():
+            path = f'{path[:-3]}({int(path[-2]) + 1})'
+        else:
+            path += ' (2)'
+
+    os.makedirs(path)
+
+    loadCategories()
+
+def deleteCategory(category):
+    if category in {'default','unused'}:
+        msgbox.showerror('Error','This category cannot be deleted.')
+
+    print(category)
+
+    return
+
+    for sound in os.listdir(f'sounds/{category}'):
+        os.rename(f'sounds/{category}/{sound}',f'sounds/unused/{sound}')
+    os.rmdir(f'sounds/{category}')
+
+    loadCategories()
+    createButtons(selectedCategory)
+
+def createButtons(selected_category):
     global buttons
     for button in buttons:
-        button.place_forget()
+        button.destroy()
     buttons = []
 
-    for sound in profiles[profile]:
+    if selected_category not in categories:
+        selected_category = 'default'
+
+    for sound in categories[selected_category]:
         def createCallback(filename):
-            path = os.path.join('sounds', profile, filename)
+            path = os.path.join('sounds', selected_category, filename)
             def callback():
                 global volume
-                sl.playSound(path,volume=volumeSlider.get()*2, normalize_db=normalize_db, bass_boost=bass_boost)
-                sl.playSound(path,device=output_device,volume=volumeSlider.get()*2, normalize_db=normalize_db, bass_boost=bass_boost)
+                # Default speakers
+                sl.playSound(
+                    path,
+                    volume=volumeSlider.get()*2,
+                    normalize_db=config.audio.normalize_db,
+                    bass_boost=config.audio.bass_boost
+                )
+                
+                t.sleep(0.01)
+                
+                # VB Cable
+                sl.playSound(
+                    path,
+                    device=config.devices.output_device,
+                    volume=volumeSlider.get()*2,
+                    normalize_db=config.audio.normalize_db,
+                    bass_boost=config.audio.bass_boost
+                )
+
             return callback
 
         # Create button
@@ -65,26 +139,46 @@ def createButtons(profile):
 
         buttons.append(b)
 
-createButtons(selectedProfile)
+    if 'configure' in globals():
+        configure(root.winfo_width(),root.winfo_height(),'.')
 
-topBar = tki.CTkFrame(root,500,28)
-topBar.place(x=3,y=0)
+@run
+def loadCategories():
+    global topButtons
+    for button in topButtons:
+        button.destroy()
+    topButtons = []
 
-for profile in profiles:
-    def createCallback(profile):
-        def callback():
-            createButtons(profile)
-            configure(root.winfo_width(),root.winfo_height(),'.')
-        return callback
+    for category in os.listdir('sounds'):
+        if not os.path.isdir(f'sounds/{category}'):
+            continue
+        if category == 'unused':
+            continue
 
-    b = tki.CTkButton(
-        topBar,
-        width=0,
-        height=26,
-        text=profile,
-        command=createCallback(profile)
-    )
-    b.pack(side='left',padx=2,pady=2)
+        categories[category] = os.listdir(f'sounds/{category}')
+
+        b = tki.CTkButton(
+            topBar,
+            width=0,
+            height=26,
+            text=category,
+            command=createCallback(createButtons,category)
+        )
+        b.pack(side='left',padx=2,pady=2)
+
+        menu = tk.Menu(topBar,tearoff=0)
+        menu.add_command(label='Create', command=newCategory)
+
+        if category != 'default':
+            menu.add_command(label=f'Delete {category}', command=createCallback(deleteCategory,category))
+
+        b.bind('<Button-3>', lambda e: menu.tk_popup(e.x_root,e.y_root))
+
+
+        topButtons.append(b)
+
+
+createButtons(selectedCategory)
 
 bottomBar = tki.CTkFrame(root,500,28)
 bottomBar.place(x=0,y=0)
@@ -107,16 +201,17 @@ volumeSlider = tki.CTkSlider(
     bottomBar,
     width=135,
     height=20,
-    from_=0.1,
-    to=10,
+    from_=config.audio.min_volume*2,
+    to=config.audio.max_volume*2,
     command=updateVolume
 )
-volumeSlider.set(volume)
+
+volumeSlider.set(config.audio.volume)
 volumeSlider.place(x=40, y=3)
 
 def toggleMic():
     if micToggle.get():
-        sl.startMicPassthrough(output_device,17)
+        sl.startMicPassthrough(config.devices.output_device,config.devices.input_device)
     else:
         sl.stopMicPassthrough()
 
@@ -144,7 +239,7 @@ def configure(width,height,widget):
         return
 
     # Reposition controls from right to left
-    volumeSlider.configure(width=width*0.8-215)
+    volumeSlider.configure(width=width*0.8-175)
     micToggle.place_configure(x=width-stopButton.winfo_width()-micToggle.winfo_width()+35, y=3)
     stopButton.place_configure(x=width-stopButton.winfo_width()+2, y=0)
 
@@ -156,6 +251,7 @@ def configure(width,height,widget):
         button.place_configure(x=5+(i % buttonsPerRow) * (buttonWidth*1.3), y=43+(i // buttonsPerRow) * buttonHeight*1.4)
 
 root.bind('<Configure>', lambda e: configure(e.width,e.height,e.widget))
+
 
 root.mainloop()
 sl.stopAll()

@@ -10,67 +10,71 @@ class StreamInfo(NamedTuple):
     timestamp: float
 
 class IIRFilter:
-    """Applies a second-order low-shelf filter to the input audio.
-
-    This filter boosts frequencies below a cutoff frequency (around 150Hz by default).
-    It uses a direct form II transposed structure for processing.
-
-    Attributes:
-        b (np.ndarray): Numerator coefficients of the filter.
-        a (np.ndarray): Denominator coefficients of the filter.
-        state (np.ndarray): Internal state of the filter, used for processing.
-
-    """
-
     def __init__(self, samplerate: int, boost: float = 1.5):
-        """Initializes the IIR filter.
-
-        Args:
-            samplerate (int): The audio sample rate.
-            boost (float, optional): The gain boost in dB. Defaults to 1.5.
-
-        """
-        # Calculate coefficients for ~150Hz boost
+        # Pre-calculate coefficients
         f = 150.0
         w0 = 2 * np.pi * (f / samplerate)
-        cos_w0 = np.cos(w0)
-        sin_w0 = np.sin(w0)
+        cos_w0, sin_w0 = np.cos(w0), np.sin(w0)
         alpha = sin_w0 / 2
-
         A = np.power(10, boost/40)
-
-        # Filter coefficients (second-order low shelf)
-        b0 = A * ((A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha)
-        b1 = 2*A * ((A-1) - (A+1)*cos_w0)
-        b2 = A * ((A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
+        
+        # Optimized coefficient calculation
+        self.b = np.array([
+            A * ((A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha),
+            2*A * ((A-1) - (A+1)*cos_w0),
+            A * ((A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
+        ], dtype=np.float32)
+        
         a0 = (A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
-        a1 = -2 * ((A-1) + (A+1)*cos_w0)
-        a2 = (A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha
-
-        # Normalize coefficients
-        self.b = np.array([b0/a0, b1/a0, b2/a0])
-        self.a = np.array([1.0, a1/a0, a2/a0])
-        self.state = np.zeros((2, 2))  # 2 channels, 2 delay elements each
+        self.a = np.array([
+            1.0,
+            -2 * ((A-1) + (A+1)*cos_w0) / a0,
+            ((A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha) / a0
+        ], dtype=np.float32)
+        
+        self.b /= a0
+        self.state = np.zeros((2, 2), dtype=np.float32)
+        self.buffer = None
 
     def process(self, x):
-        """Processes audio samples through the filter.
-
-        Args:
-            x (np.ndarray): Input audio data (2D array, samples x channels).
-
-        Returns:
-            np.ndarray: Filtered audio data.
-
-        """
-        y = np.zeros_like(x)
+        if self.buffer is None or self.buffer.shape != x.shape:
+            self.buffer = np.zeros_like(x, dtype=np.float32)
+        
+        # Vectorized processing
         for ch in range(x.shape[1]):
-            for n in range(len(x)):
-                w0 = x[n,ch] - self.a[1]*self.state[ch,0] - self.a[2]*self.state[ch,1]
-                y[n,ch] = self.b[0]*w0 + self.b[1]*self.state[ch,0] + self.b[2]*self.state[ch,1]
-                self.state[ch,1] = self.state[ch,0]
-                self.state[ch,0] = w0
-        return np.clip(y, -1.0, 1.0)
+            self.buffer[:,ch] = np.convolve(x[:,ch], self.b, mode='same') - \
+                               np.convolve(x[:,ch], self.a[1:], mode='same')
+        return np.clip(self.buffer, -1.0, 1.0)
 
+class Resampler:
+    def __init__(self, data, src_rate, target_rate):
+        self.data = data
+        self.ratio = target_rate / src_rate
+        self.src_pos = 0
+        self.src_frames = len(data)
+        self.buffer = None
+        self.old_time = None
+        self.new_time = None
+    
+    def process_chunk(self, frames_needed):
+        src_frames = min(int(frames_needed / self.ratio) + 2, self.src_frames - self.src_pos)
+        if src_frames <= 0:
+            return None
+
+        src_chunk = self.data[self.src_pos:self.src_pos + src_frames]
+        self.src_pos += src_frames
+        
+        # Pre-allocate buffers
+        if self.buffer is None or self.buffer.shape[0] != int(src_frames * self.ratio):
+            self.old_time = np.linspace(0, 1, src_frames, dtype=np.float32)
+            self.new_time = np.linspace(0, 1, int(src_frames * self.ratio), dtype=np.float32)
+            self.buffer = np.zeros((int(src_frames * self.ratio), src_chunk.shape[1]), dtype=np.float32)
+        
+        # Vectorized resampling
+        for ch in range(src_chunk.shape[1]):
+            self.buffer[:, ch] = np.interp(self.new_time, self.old_time, src_chunk[:, ch])
+        
+        return self.buffer
 
 
 # Constants
@@ -85,101 +89,31 @@ active_count.set()
 mic_stream = None
 mic_lock = threading.Lock()
 
-def _resample_audio(data: np.ndarray, src_rate: int, target_rate: int) -> np.ndarray:
-    """Resamples audio data to a new sample rate.
-
-    Uses linear interpolation to resample the audio data from the source sample rate to the target sample rate.
-
-    Args:
-        data (np.ndarray): The audio data to resample.
-        src_rate (int): The original sample rate of the audio data.
-        target_rate (int): The desired sample rate.
-
-    Returns:
-        np.ndarray: The resampled audio data.
-
-    """
-    if src_rate == target_rate:
-        return data
-
-    # Calculate new length
-    ratio = target_rate / src_rate
-    new_len = int(len(data) * ratio)
-
-    # Create time arrays
-    old_time = np.linspace(0, 1, len(data))
-    new_time = np.linspace(0, 1, new_len)
-
-    # Handle mono vs stereo
-    if len(data.shape) == 1:
-        return np.interp(new_time, old_time, data)
-
-    # Handle stereo by resampling each channel
-    resampled = np.zeros((new_len, data.shape[1]), dtype=np.float32)
-    for channel in range(data.shape[1]):
-        resampled[:, channel] = np.interp(new_time, old_time, data[:, channel])
-
-    return resampled
-
 def _make_cache_key(filename: str, volume: float, normalize_db: int, bass_boost: float) -> str:
-    """Creates a unique cache key for audio processing parameters.
-
-    Combines the filename and audio processing parameters into a string to be used as a cache key.
-
-    Args:
-        filename (str): The name of the audio file.
-        volume (float): The volume adjustment.
-        normalize_db (int): The normalization level in dB.
-        bass_boost (float): The bass boost level.
-
-    Returns:
-        str: The generated cache key.
-
-    """
+    """Create cache key including all processing parameters"""
     return f"{filename}|{volume}|{normalize_db}|{bass_boost}"
 
-def loadSound(filename: str, volume: float = 1.0, normalize_db: int = None, bass_boost: float = 0.0, silence_threshold: float = 0.01) -> tuple:
-    """Loads and processes an audio file.
-
-    Loads the audio, applies optional normalization, bass boost, and volume adjustment, and caches the result.
-
-    Args:
-        filename (str): Path to the audio file.
-        volume (float, optional): Volume adjustment (0.0 to 1.0). Defaults to 1.0.
-        normalize_db (int, optional): Target loudness in dB. If None, no normalization is applied. Defaults to None.
-        bass_boost (float, optional): Bass boost level. Defaults to 0.0.
-        silence_threshold (float, optional): Threshold for silence detection. Defaults to 0.01.
-
-    Returns:
-        tuple: A tuple containing the processed audio data and the sample rate.
-
-    Raises:
-        RuntimeError: If the audio file cannot be loaded or processed.
-
-    """
+def loadSound(
+        filename: str,
+        volume: float = 1.0,
+        normalize_db: int = None,
+        bass_boost: float = 0.0
+    ) -> tuple:
     try:
         cache_key = _make_cache_key(filename, volume, normalize_db, bass_boost)
 
         if cache_key not in sounds:
             # Load raw audio if not cached
             if filename not in sounds:
-                data, samplerate = sf.read(filename)
-
-                # Remove silence from start
-                if len(data.shape) == 1:
-                    start_idx = np.where(np.abs(data) > silence_threshold)[0]
-                else:
-                    start_idx = np.where(np.max(np.abs(data), axis=1) > silence_threshold)[0]
-                if len(start_idx) > 0:
-                    data = data[start_idx[0]:]
-
-                sounds[filename] = (data, samplerate)  # Cache raw audio
+                data, sr = sf.read(filename)
+                sounds[filename] = (data, sr)  # Cache raw
             else:
-                data, samplerate = sounds[filename]  # Get cached raw audio
+                data, sr = sounds[filename]  # Get cached raw
 
-            # Apply processing
+            # Process audio
             processed_data = data.copy()
 
+            # Apply normalization if needed
             if normalize_db is not None:
                 rms = np.sqrt(np.mean(processed_data**2))
                 current_db = 20 * np.log10(rms) if rms > 0 else -100
@@ -187,14 +121,16 @@ def loadSound(filename: str, volume: float = 1.0, normalize_db: int = None, bass
                 gain_linear = 10 ** (gain_db / 20)
                 processed_data = processed_data * gain_linear
 
+            # Apply bass boost if needed
             if bass_boost > 0:
-                audio_filter = IIRFilter(samplerate, bass_boost)
+                audio_filter = IIRFilter(sr, bass_boost)
                 processed_data = audio_filter.process(processed_data)
 
+            # Apply volume and clip
             processed_data = processed_data * volume
             processed_data = np.clip(processed_data, -1.0, 1.0)
 
-            sounds[cache_key] = (processed_data, samplerate)  # Cache processed version
+            sounds[cache_key] = (processed_data, sr)
 
         return sounds[cache_key]
     except Exception as e:
@@ -211,8 +147,8 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_
         bass_boost: Amount of bass boost in dB (default: 0.0)
     """
     try:
+        # Check sound limit
         with streams_lock:
-            # Check sound limit
             if len(active_streams) >= MAX_CONCURRENT_SOUNDS:
                 # Remove finished streams first
                 active_streams[:] = [s for s in active_streams if s.stream.active]
@@ -228,7 +164,9 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_
 
         device_info = sd.query_devices(device=device or sd.default.device[1])
         target_samplerate = int(device_info['default_samplerate'])
-        data = _resample_audio(data, src_samplerate, target_samplerate)
+
+        # Create resampling state
+        resampler = Resampler(data, src_samplerate, target_samplerate)
 
         if len(data.shape) == 1:
             data = np.column_stack((data, data))
@@ -239,29 +177,31 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_
 
         def _audio_callback(outdata, frames, time, status):
             if status:
-                print(f'Status: {status}')
+                print(f'Error: {status}')
 
-            remaining = len(data) - stream.current_frame
-            if remaining == 0:
+            # Resample chunk
+            chunk = resampler.process_chunk(frames)
+            if chunk is None:
                 raise sd.CallbackStop()
-
-            valid_frames = min(remaining, frames)
-            chunk = data[stream.current_frame:stream.current_frame + valid_frames]
 
             # Apply bass boost in realtime if enabled
             if audio_filter is not None:
                 chunk = audio_filter.process(chunk)
 
-            outdata[:valid_frames] = chunk
+            # Copy resampled data to output
+            valid_frames = min(len(chunk), frames)
+            outdata[:valid_frames] = chunk[:valid_frames]
             if valid_frames < frames:
                 outdata[valid_frames:] = 0
-            stream.current_frame += valid_frames
 
+        # Create output stream with larger buffer
         stream = sd.OutputStream(
-            samplerate=target_samplerate,
-            channels=data.shape[1],
+            device=device,
+            channels=2,
             callback=_audio_callback,
-            device=device
+            samplerate=target_samplerate,
+            dtype=np.float32,
+            latency='low'
         )
 
         stream.current_frame = 0
@@ -313,7 +253,7 @@ def stopAll() -> None:
         active_streams.clear()
 
 def startMicPassthrough(output_device, input_device=None, volume: float = 1.0) -> None:
-    """Start microphone passthrough with resampling support
+    """Start microphone passthrough with resampling.
 
     Args:
         output_device: Output device name or index (required)
@@ -321,16 +261,13 @@ def startMicPassthrough(output_device, input_device=None, volume: float = 1.0) -
         volume: Volume multiplier (0.0 to 2.0, default: 1.0)
     """
     global mic_stream
-
     try:
-        # Use system default for input if not specified
         if input_device is None:
             input_device = sd.default.device[0]
 
         # Get device info and sample rates
         input_info = sd.query_devices(input_device)
         output_info = sd.query_devices(output_device)
-
         input_rate = int(input_info['default_samplerate'])
         output_rate = int(output_info['default_samplerate'])
 
@@ -338,28 +275,35 @@ def startMicPassthrough(output_device, input_device=None, volume: float = 1.0) -
             if mic_stream is not None:
                 stopMicPassthrough()
 
+            # Create resampler if rates differ
+            resampler = Resampler(None, input_rate, output_rate) if input_rate != output_rate else None
+
             def callback(indata, outdata, frames, time, status):
+                if status:
+                    print(f'Status: {status}')
+
                 # Ensure correct channel count
-                indata = indata[:, :2] if indata.shape[1] > 2 else indata
+                audio = indata[:, :2] if indata.shape[1] > 2 else indata
 
+                # Resample if needed
+                if resampler is not None:
+                    resampler.data = audio  # Update source data
+                    audio = resampler.process_chunk(frames)
+                    if audio is None:
+                        outdata.fill(0)
+                        return
 
-                # Resample if rates differ
-                if input_rate != output_rate:
-                    resampled = _resample_audio(indata, input_rate, output_rate)
-                    frames_to_write = min(len(resampled), len(outdata))
-                    outdata[:frames_to_write] = resampled[:frames_to_write] * volume
-                    if frames_to_write < len(outdata):
-                        outdata[frames_to_write:] = 0
-                else:
-                    outdata[:] = indata * volume
+                # Copy to output with volume
+                valid_frames = min(len(audio), frames)
+                outdata[:valid_frames] = audio[:valid_frames] * volume
+                if valid_frames < frames:
+                    outdata[valid_frames:].fill(0)
 
             mic_stream = sd.Stream(
                 device=(input_device, output_device),
                 callback=callback,
                 dtype=np.float32,
-                samplerate=output_rate,
-                channels=(input_info['max_input_channels'],
-                         output_info['max_output_channels'])
+                samplerate=output_rate
             )
             mic_stream.start()
 
@@ -386,4 +330,4 @@ def stopMicPassthrough() -> None:
 
 
 # Update __all__
-__all__ = [loadSound, playSound, stopAll, startMicPassthrough, stopMicPassthrough]
+__all__ = ['loadSound', 'playSound', 'stopAll', 'startMicPassthrough', 'stopMicPassthrough']
