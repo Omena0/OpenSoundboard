@@ -6,7 +6,6 @@ py -m nuitka --standalone --onefile
  --product-name="OpenSoundboard" --product-version=1.0.0
  --file-description="OpenSoundboard"
  --enable-plugin=tk-inter
- --nofollow-import-to=nuitka
  --copyright="Copyright © 2025 Omena0. All rights reserved."
  --output-dir="build"
  --deployment --python-flag="-OO" --python-flag="-S"
@@ -16,9 +15,8 @@ py -m nuitka --standalone --onefile
 
 
 def build():
-    os.makedirs('dist', exist_ok=True)
     os.system(build_command)
-    shutil.move('build/OpenSoundboard.exe', 'dist/OpenSoundboard.exe')
+    shutil.move('build/OpenSoundboard.exe', 'OpenSoundboard.exe')
 
 if __name__ == "__main__":
     build()
