@@ -5,77 +5,54 @@ import numpy as np
 import threading
 import time
 
+
 class StreamInfo(NamedTuple):
     stream: sd.OutputStream
     timestamp: float
-
-class IIRFilter:
-    def __init__(self, samplerate: int, boost: float = 1.5):
-        # Pre-calculate coefficients
-        f = 150.0
-        w0 = 2 * np.pi * (f / samplerate)
-        cos_w0, sin_w0 = np.cos(w0), np.sin(w0)
-        alpha = sin_w0 / 2
-        A = np.power(10, boost/40)
-        
-        # Optimized coefficient calculation
-        self.b = np.array([
-            A * ((A+1) - (A-1)*cos_w0 + 2*np.sqrt(A)*alpha),
-            2*A * ((A-1) - (A+1)*cos_w0),
-            A * ((A+1) - (A-1)*cos_w0 - 2*np.sqrt(A)*alpha)
-        ], dtype=np.float32)
-        
-        a0 = (A+1) + (A-1)*cos_w0 + 2*np.sqrt(A)*alpha
-        self.a = np.array([
-            1.0,
-            -2 * ((A-1) + (A+1)*cos_w0) / a0,
-            ((A+1) + (A-1)*cos_w0 - 2*np.sqrt(A)*alpha) / a0
-        ], dtype=np.float32)
-        
-        self.b /= a0
-        self.state = np.zeros((2, 2), dtype=np.float32)
-        self.buffer = None
-
-    def process(self, x):
-        if self.buffer is None or self.buffer.shape != x.shape:
-            self.buffer = np.zeros_like(x, dtype=np.float32)
-        
-        # Vectorized processing
-        for ch in range(x.shape[1]):
-            self.buffer[:,ch] = np.convolve(x[:,ch], self.b, mode='same') - \
-                               np.convolve(x[:,ch], self.a[1:], mode='same')
-        return np.clip(self.buffer, -1.0, 1.0)
 
 class Resampler:
     def __init__(self, data, src_rate, target_rate):
         self.data = data
         self.ratio = target_rate / src_rate
         self.src_pos = 0
-        self.src_frames = len(data)
+        self.src_frames = len(data) if data is not None else 0
         self.buffer = None
         self.old_time = None
         self.new_time = None
-    
+
     def process_chunk(self, frames_needed):
-        src_frames = min(int(frames_needed / self.ratio) + 2, self.src_frames - self.src_pos)
+        src_frames = min(
+            int(frames_needed / self.ratio) + 2,
+            self.src_frames - self.src_pos
+        )
         if src_frames <= 0:
             return None
 
         src_chunk = self.data[self.src_pos:self.src_pos + src_frames]
         self.src_pos += src_frames
-        
+
         # Pre-allocate buffers
         if self.buffer is None or self.buffer.shape[0] != int(src_frames * self.ratio):
             self.old_time = np.linspace(0, 1, src_frames, dtype=np.float32)
-            self.new_time = np.linspace(0, 1, int(src_frames * self.ratio), dtype=np.float32)
-            self.buffer = np.zeros((int(src_frames * self.ratio), src_chunk.shape[1]), dtype=np.float32)
-        
+            self.new_time = np.linspace(
+                0,
+                1,
+                int(src_frames * self.ratio),
+                dtype=np.float32
+            )
+            self.buffer = np.zeros(
+                (
+                    int(src_frames * self.ratio),
+                    src_chunk.shape[1]
+                ),
+                dtype=np.float32
+            )
+
         # Vectorized resampling
         for ch in range(src_chunk.shape[1]):
             self.buffer[:, ch] = np.interp(self.new_time, self.old_time, src_chunk[:, ch])
-        
-        return self.buffer
 
+        return self.buffer
 
 # Constants
 MAX_CONCURRENT_SOUNDS = 64
@@ -89,62 +66,96 @@ active_count.set()
 mic_stream = None
 mic_lock = threading.Lock()
 
-def _make_cache_key(filename: str, volume: float, normalize_db: int, bass_boost: float) -> str:
+
+def _make_cache_key(*args) -> str:
     """Create cache key including all processing parameters"""
-    return f"{filename}|{volume}|{normalize_db}|{bass_boost}"
+    return '|'.join(map(str, args))
+
+def normalize_audio(data, target_db=-12, allow_attenuation=True):
+    """
+    Normalize audio using RMS so that the average level (in dB) reaches target_db.
+    If allow_attenuation is False, only boost quiet sounds.
+    """
+    # Calculate RMS (root mean square)
+    rms = np.sqrt(np.mean(data**2))
+    if rms == 0:
+        return data  # avoid division by zero
+
+    # Convert RMS to dB
+    current_db = 20 * np.log10(rms)
+    gain_db = target_db - current_db
+
+    # If we don't allow attenuation, only boost quiet sounds
+    if not allow_attenuation and gain_db < 0:
+        gain_db = 0
+
+    gain = 10 ** (gain_db / 20)
+    # Optionally cap the gain
+    gain = min(gain, 10.0)
+    return data * gain
+
+def trim_leading_silence(data, threshold=0.02):
+    """
+    Remove silence from the beginning of the audio data.
+    Args:
+      data: NumPy array of audio samples.
+      threshold: amplitude threshold below which samples are considered silent.
+    Returns:
+      Audio data trimmed of leading silence.
+    """
+    # Convert stereo to mono for silence detection.
+    amplitude = np.max(np.abs(data), axis=1) if data.ndim > 1 else np.abs(data)
+    # Find first index where amplitude exceeds threshold.
+    indices = np.where(amplitude > threshold)[0]
+    return data if len(indices) == 0 else data[indices[0]:]
 
 def loadSound(
         filename: str,
-        volume: float = 1.0,
-        normalize_db: int = None,
-        bass_boost: float = 0.0
-    ) -> tuple:
+        target_db: int = None,
+) -> tuple:
     try:
-        cache_key = _make_cache_key(filename, volume, normalize_db, bass_boost)
+        cache_key = _make_cache_key(filename, target_db)
 
         if cache_key not in sounds:
             # Load raw audio if not cached
             if filename not in sounds:
                 data, sr = sf.read(filename)
-                sounds[filename] = (data, sr)  # Cache raw
             else:
-                data, sr = sounds[filename]  # Get cached raw
+                return sounds[filename]
 
-            # Process audio
-            processed_data = data.copy()
+            # Trim leading silence before normalization
+            data = trim_leading_silence(data, threshold=0.01)
 
-            # Apply normalization if needed
-            if normalize_db is not None:
-                rms = np.sqrt(np.mean(processed_data**2))
-                current_db = 20 * np.log10(rms) if rms > 0 else -100
-                gain_db = normalize_db - current_db
-                gain_linear = 10 ** (gain_db / 20)
-                processed_data = processed_data * gain_linear
+            # Replace existing normalization code with:
+            if target_db is not None:
+                data = normalize_audio(
+                    data,
+                    target_db=target_db
+                )
 
-            # Apply bass boost if needed
-            if bass_boost > 0:
-                audio_filter = IIRFilter(sr, bass_boost)
-                processed_data = audio_filter.process(processed_data)
+            # Clip audio in a reasonable range
+            data = np.clip(data, -1.0, 1.0)
 
-            # Apply volume and clip
-            processed_data = processed_data * volume
-            processed_data = np.clip(processed_data, -1.0, 1.0)
-
-            sounds[cache_key] = (processed_data, sr)
+            sounds[cache_key] = (data, sr)
 
         return sounds[cache_key]
     except Exception as e:
         raise RuntimeError(f"Failed to load audio file {filename}: {str(e)}") from e
 
-def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_db:int = -20, bass_boost: float = 0.0) -> None:
-    """Play sound non-blocking with optional device selection, volume control, and bass boost
+def playSound(
+    filename: str,
+    device: str = None,
+    volume: float = 1.0,
+    normalize_db: int = -20
+) -> None:
+    """
+    Play sound non-blocking with optional device selection, volume control, and bass boost
 
     Args:
         filename: Path to sound file
         device: Output device name/index (optional)
         volume: Volume multiplier (0.0 to 3.0, default 1.0)
-        normalize: Whether to normalize audio volume (default: False)
-        bass_boost: Amount of bass boost in dB (default: 0.0)
+        normalize_db: Decibel level for normalization (default: -20)
     """
     try:
         # Check sound limit
@@ -160,20 +171,23 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_
                     active_streams.remove(oldest)
 
         # Load and process audio
-        data, src_samplerate = loadSound(filename, volume, normalize_db, bass_boost)
+        data, src_samplerate = loadSound(filename, normalize_db)
+
+        # Convert mono to stereo before applying volume multiplication and resampling
+        if data.ndim == 1:
+            data = np.column_stack((data, data))
+
+        # Apply volume multiplier first
+        data = data.astype(np.float32)
+
+        # Multiply and then use a soft clipping function (tanh) for smoother compression
+        data = np.tanh(data * volume)
 
         device_info = sd.query_devices(device=device or sd.default.device[1])
         target_samplerate = int(device_info['default_samplerate'])
 
-        # Create resampling state
+        # Now create resampling state with the high-volume data
         resampler = Resampler(data, src_samplerate, target_samplerate)
-
-        if len(data.shape) == 1:
-            data = np.column_stack((data, data))
-        data = data.astype(np.float32) * np.float32(volume)
-
-        # Create filter if bass boost enabled
-        audio_filter = IIRFilter(target_samplerate, bass_boost) if bass_boost > 0 else None
 
         def _audio_callback(outdata, frames, time, status):
             if status:
@@ -183,10 +197,6 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_
             chunk = resampler.process_chunk(frames)
             if chunk is None:
                 raise sd.CallbackStop()
-
-            # Apply bass boost in realtime if enabled
-            if audio_filter is not None:
-                chunk = audio_filter.process(chunk)
 
             # Copy resampled data to output
             valid_frames = min(len(chunk), frames)
@@ -201,7 +211,7 @@ def playSound(filename: str, device: str = None, volume: float = 1.0, normalize_
             callback=_audio_callback,
             samplerate=target_samplerate,
             dtype=np.float32,
-            latency='low'
+            latency='high'
         )
 
         stream.current_frame = 0
@@ -252,7 +262,11 @@ def stopAll() -> None:
                 ...  # Ignore errors during forced cleanup
         active_streams.clear()
 
-def startMicPassthrough(output_device, input_device=None, volume: float = 1.0) -> None:
+def startMicPassthrough(
+    output_device,
+    input_device=None,
+    volume: float = 1.0
+) -> None:
     """Start microphone passthrough with resampling.
 
     Args:
@@ -276,7 +290,11 @@ def startMicPassthrough(output_device, input_device=None, volume: float = 1.0) -
                 stopMicPassthrough()
 
             # Create resampler if rates differ
-            resampler = Resampler(None, input_rate, output_rate) if input_rate != output_rate else None
+            resampler = Resampler(
+                None,
+                input_rate,
+                output_rate
+            ) if input_rate != output_rate else None
 
             def callback(indata, outdata, frames, time, status):
                 if status:
@@ -330,4 +348,11 @@ def stopMicPassthrough() -> None:
 
 
 # Update __all__
-__all__ = ['loadSound', 'playSound', 'stopAll', 'startMicPassthrough', 'stopMicPassthrough']
+__all__ = [
+    'loadSound',
+    'playSound',
+    'stopAll',
+    'startMicPassthrough',
+    'stopMicPassthrough'
+]
+
